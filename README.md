@@ -55,12 +55,27 @@ YLMassRemove packages a broad set of removal tools in a single module:
 ---
 
 ## Requirements
-- PowerShell 3.0 or later recommended for Publish-Module and modern module support
+- PowerShell 7 or later recommended for Publish-Module and modern module support
 - Module metadata targets PowerShell 5.1 for full feature support
 - Compatible with Desktop and Core editions of PowerShell
 - Administrative privileges are required for deep system changes (uninstalling system-scoped apps, registry sweeps, stopping services, removing drivers)
 
 ---
+
+## Flags
+-Recurse
+-Cleanup
+-Nuke
+-Search
+-Help
+-Erase
+-DryRun
+-Force
+
+---
+
+
+
 
 ## Quick installation
 
