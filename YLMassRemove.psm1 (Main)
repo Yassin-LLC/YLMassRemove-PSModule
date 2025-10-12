@@ -1,0 +1,1429 @@
+<#
+.SYNOPSIS
+YLMassRemove core module implementation.
+
+.DESCRIPTION
+This module contains enhanced, robust, and well-documented cmdlets for
+mass removal tasks, UWP management, update handling, listing, and a
+dynamic help system (YL-Help). The module emphasizes safety (Confirm,
+WhatIf), logging, dry-run modes, and clear, descriptive help output.
+
+.NOTES
+Author: DoorsPastaLLC
+Module: YLMassRemove
+Version: 3.5.0.1
+#>
+
+#region Module initialization and shared helpers
+
+# Module-wide variables
+Set-Variable -Name YL_ModuleLoadedAt -Value (Get-Date) -Scope Script -Option ReadOnly,AllScope
+Set-Variable -Name YL_DefaultLogPath -Value (Join-Path $env:ALLUSERSPROFILE 'YLMassRemove\ylmassremove.log') -Scope Script -Option ReadOnly,AllScope
+Set-Variable -Name YL_EnableVerboseLog -Value $false -Scope Script -Option AllScope
+Set-Variable -Name YL_CommandRegistry -Value @{} -Scope Script
+
+# Ensure log directory exists
+$logDir = Split-Path -Path $YL_DefaultLogPath -Parent
+if (-not (Test-Path -Path $logDir)) {
+    New-Item -Path $logDir -ItemType Directory -Force | Out-Null
+}
+
+function Write-YLLog {
+<#
+.SYNOPSIS
+Write an entry to the module log.
+
+.PARAMETER Message
+Message to write.
+
+.PARAMETER Level
+Log level - INFO, WARN, ERROR, DEBUG.
+
+.PARAMETER NoConsole
+Suppress console output.
+
+.DESCRIPTION
+Writes timestamped log entries to default log path and optionally to console.
+#>
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Message,
+
+        [ValidateSet('INFO','WARN','ERROR','DEBUG')]
+        [string]$Level = 'INFO',
+
+        [switch]$NoConsole
+    )
+    $time = (Get-Date).ToString('yyyy-MM-dd HH:mm:ss')
+    $entry = "$time [$Level] $Message"
+    try {
+        Add-Content -Path $YL_DefaultLogPath -Value $entry -ErrorAction Stop
+    } catch {
+        # If writing log fails, attempt to create file
+        New-Item -Path $YL_DefaultLogPath -ItemType File -Force | Out-Null
+        Add-Content -Path $YL_DefaultLogPath -Value $entry
+    }
+    if (-not $NoConsole) {
+        switch ($Level) {
+            'ERROR' { Write-Host $entry -ForegroundColor Red }
+            'WARN'  { Write-Host $entry -ForegroundColor Yellow }
+            'DEBUG' { if ($YL_EnableVerboseLog) { Write-Host $entry -ForegroundColor Gray } }
+            default { Write-Host $entry -ForegroundColor Cyan }
+        }
+    }
+}
+
+function Get-YLModuleFunctionSignatures {
+<#
+.SYNOPSIS
+Return a registry of exported functions and help descriptions.
+
+.DESCRIPTION
+Used by YL-Help to present structured information about available cmdlets.
+#>
+    param()
+    $registry = @{}
+    $currentExports = Get-Command -Module YLMassRemove -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -eq 'Function' }
+    foreach ($cmd in $currentExports) {
+        $help = Get-Help $cmd.Name -ErrorAction SilentlyContinue
+        $short = if ($help) { ($help.Synopsis) } else { '' }
+        $params = @{}
+        try {
+            $paramInfo = (Get-Command $cmd.Name).Parameters
+            foreach ($p in $paramInfo.GetEnumerator()) {
+                $params[$p.Key] = @{
+                    Type = $p.Value.ParameterType.Name
+                    Mandatory = $p.Value.Attributes | Where-Object { $_ -is [System.Management.Automation.ParameterAttribute] } | ForEach-Object { $_.Mandatory }
+                }
+            }
+        } catch { }
+        $registry[$cmd.Name] = @{
+            Synopsis = $short
+            Parameters = $params
+        }
+    }
+    return $registry
+}
+
+# Helper to ensure pipeline input handling in cmdlets
+function ConvertTo-ArrayOfObjects {
+    param(
+        [Parameter(ValueFromPipeline=$true)]
+        $InputObject
+    )
+    process {
+        if ($null -eq $InputObject) { return }
+        elseif ($InputObject -is [System.Array]) { $InputObject }
+        else { ,$InputObject }
+    }
+}
+
+#endregion
+
+#region Common parameter sets and helpers for operations
+
+function Invoke-YLSafeAction {
+<#
+.SYNOPSIS
+Wrapper for safe execution of destructive actions with support for -WhatIf, -Confirm, DryRun and logging.
+
+.PARAMETER Action
+ScriptBlock representing destructive action.
+
+.PARAMETER Description
+Human readable description for logs and confirmation prompts.
+
+.PARAMETER ConfirmPreference
+If set, will prompt using ShouldProcess and ShouldContinue patterns.
+
+.PARAMETER DryRun
+If set, action is not executed.
+
+.PARAMETER Force
+If set, bypass confirmations.
+
+.DESCRIPTION
+Centralizes confirmation, WhatIf, and dry-run behavior for module cmdlets.
+#>
+    param(
+        [Parameter(Mandatory=$true)]
+        [ScriptBlock]$Action,
+
+        [string]$Description = 'Perform action',
+
+        [switch]$DryRun,
+
+        [switch]$Force
+    )
+
+    # Use ShouldProcess for PowerShell standardized confirmation
+    $supportsShouldProcess = $PSCmdlet.ShouldProcess($Description)
+    if ($DryRun) {
+        Write-YLLog -Message "DRYRUN: $Description" -Level 'INFO'
+        return $true
+    }
+    if ($Force -or $PSCmdlet.ShouldProcess($Description)) {
+        try {
+            & $Action
+            Write-YLLog -Message "SUCCESS: $Description" -Level 'INFO'
+            return $true
+        } catch {
+            Write-YLLog -Message "FAILED: $Description - $_" -Level 'ERROR'
+            throw
+        }
+    } else {
+        Write-YLLog -Message "SKIPPED: $Description (user declined)" -Level 'WARN'
+        return $false
+    }
+}
+
+#endregion
+
+#region Exported functions with enhanced behavior
+
+function App-Uninstall {
+<#
+.SYNOPSIS
+Uninstall a Windows application by name, package, or MSI product code.
+
+.DESCRIPTION
+Attempts multiple strategies to uninstall an application:
+- Uses Get-WmiObject / Get-CimInstance to find uninstall strings
+- Uses Start-Process with uninstall command for classic apps
+- Uses Remove-AppxPackage for UWP apps when required
+- Supports -WhatIf, -Confirm and -DryRun
+- Provides verbose, progress and logging
+
+.PARAMETER Name
+Name or partial name of application to uninstall.
+
+.PARAMETER MsiProductCode
+MSI product code GUID to uninstall.
+
+.PARAMETER Recurse
+Attempt to remove associated files and registry entries.
+
+.PARAMETER DryRun
+Simulate actions without performing them.
+
+.PARAMETER Force
+Bypass confirmations.
+
+.PARAMETER Confirm
+Standard -Confirm switch.
+
+.EXAMPLE
+App-Uninstall -Name "7-Zip" -Recurse
+#>
+    [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
+    param(
+        [Parameter(Mandatory=$false,Position=0,ValueFromPipeline=$true,ValueFromPipelineByPropertyName=$true)]
+        [string]$Name,
+
+        [Parameter(Mandatory=$false)]
+        [ValidatePattern('^\{?[0-9A-Fa-f\-]{36}\}?$')]
+        [string]$MsiProductCode,
+
+        [switch]$Recurse,
+
+        [switch]$DryRun,
+
+        [switch]$Force
+    )
+
+    begin {
+        Write-YLLog -Message "App-Uninstall invoked; Name=$Name; MsiProductCode=$MsiProductCode; Recurse=$Recurse" -Level 'DEBUG'
+    }
+    process {
+        if ($MsiProductCode) {
+            $desc = "Uninstall MSI product $MsiProductCode"
+            Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                $msiexec = "$env:SystemRoot\System32\msiexec.exe"
+                $args = "/x $MsiProductCode /qn /norestart"
+                Start-Process -FilePath $msiexec -ArgumentList $args -Wait -NoNewWindow
+            }
+            return
+        }
+
+        if (-not $Name) {
+            Write-YLLog -Message "No Name or MsiProductCode provided to App-Uninstall" -Level 'WARN'
+            Write-Warning "Provide -Name or -MsiProductCode"
+            return
+        }
+
+        # Search in registry for uninstall strings
+        $uninstallEntries = @()
+        $hives = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+        foreach ($h in $hives) {
+            try {
+                $items = Get-ChildItem -Path $h -ErrorAction SilentlyContinue
+                foreach ($it in $items) {
+                    $displayName = (Get-ItemProperty -Path $it.PSPath -Name DisplayName -ErrorAction SilentlyContinue).DisplayName
+                    if ($displayName -and ($displayName -like "*$Name*")) {
+                        $entry = Get-ItemProperty -Path $it.PSPath -ErrorAction SilentlyContinue
+                        $uninstallEntries += [PSCustomObject]@{
+                            Name = $displayName
+                            UninstallString = $entry.UninstallString
+                            RegistryKey = $it.PSPath
+                        }
+                    }
+                }
+            } catch { }
+        }
+
+        if (-not $uninstallEntries) {
+            # Try using Get-Package (PackageManagement)
+            try {
+                $pkgs = Get-Package -Name "*$Name*" -ErrorAction SilentlyContinue
+                foreach ($p in $pkgs) {
+                    $uninstallEntries += [PSCustomObject]@{
+                        Name = $p.Name
+                        ProviderName = $p.ProviderName
+                        Version = $p.Version
+                        Package = $p
+                    }
+                }
+            } catch { }
+        }
+
+        if (-not $uninstallEntries) {
+            # Try UWP
+            $uwpMatches = Get-AppxPackage -Name "*$Name*" -ErrorAction SilentlyContinue
+            foreach ($u in $uwpMatches) {
+                $uninstallEntries += [PSCustomObject]@{
+                    Name = $u.Name
+                    PackageFullName = $u.PackageFullName
+                    IsUWP = $true
+                }
+            }
+        }
+
+        if (-not $uninstallEntries) {
+            Write-YLLog -Message "No application matched name '$Name'" -Level 'WARN'
+            Write-Warning "No installed application matched name '$Name'"
+            return
+        }
+
+        foreach ($entry in $uninstallEntries) {
+            if ($entry.IsUWP) {
+                $desc = "Remove UWP package $($entry.PackageFullName)"
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    Remove-AppxPackage -Package $entry.PackageFullName -ErrorAction Stop
+                }
+                continue
+            }
+
+            if ($entry.UninstallString) {
+                $uStr = $entry.UninstallString
+                # Clean uninstall string if it's quoted or has arguments
+                $exe, $args = if ($uStr -match '^(["'']?)(.+?)(?:["'']?)\s*(.*)$') { @($matches[2], $matches[3]) } else { @($uStr, '') }
+                $desc = "Execute uninstall command for $($entry.Name)"
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    if ($exe -like '*.msi' -or $exe -match 'msiexec') {
+                        # Use silent uninstall switch if possible
+                        if ($exe -match 'msiexec') {
+                            Start-Process -FilePath $exe -ArgumentList $args -Wait -NoNewWindow
+                        } else {
+                            Start-Process -FilePath 'msiexec.exe' -ArgumentList "/x `"$exe`" /qn /norestart" -Wait -NoNewWindow
+                        }
+                    } else {
+                        Start-Process -FilePath $exe -ArgumentList $args -Wait -NoNewWindow
+                    }
+                }
+            } elseif ($entry.Package) {
+                $desc = "Uninstall package via provider $($entry.ProviderName) for $($entry.Name)"
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    Uninstall-Package -InputObject $entry.Package -Force
+                }
+            } else {
+                Write-YLLog -Message "Unknown uninstall path for entry: $entry" -Level 'WARN'
+            }
+
+            if ($Recurse) {
+                # Attempt to remove associated folders in Program Files and registry keys
+                $progPaths = @(
+                    Join-Path $env:ProgramFiles $entry.Name,
+                    Join-Path $env:ProgramFiles "($($entry.Name))",
+                    Join-Path $env:ProgramFilesX86 $entry.Name
+                ) | Where-Object { Test-Path $_ }
+                foreach ($p in $progPaths) {
+                    $desc = "Remove folder $p"
+                    Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                        Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
+                    }
+                }
+                # Additional registry cleanup (best effort, non-recursive)
+                try {
+                    $regKey = $entry.RegistryKey
+                    if ($regKey) {
+                        $desc = "Remove registry key $regKey"
+                        Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                            Remove-Item -Path $regKey -Recurse -Force -ErrorAction Stop
+                        }
+                    }
+                } catch { }
+            }
+        }
+    }
+    end {
+        Write-YLLog -Message "App-Uninstall completed" -Level 'DEBUG'
+    }
+}
+Export-ModuleMember -Function App-Uninstall
+
+function Mass-Remove {
+<#
+.SYNOPSIS
+Batch remove applications by list or pattern.
+
+.DESCRIPTION
+Accepts pipeline input or -InputObject list of names to remove. Wraps App-Uninstall
+with concurrency control, logging, dry-run, and a summary report at completion.
+
+.PARAMETER InputObject
+List of application names.
+
+.PARAMETER Concurrency
+Number of parallel workers (best-effort using background jobs).
+
+.PARAMETER DryRun
+Simulate removal without performing it.
+
+.PARAMETER Force
+Bypass confirmations.
+
+.EXAMPLE
+'7-Zip','Notepad++' | Mass-Remove -Concurrency 2 -DryRun
+#>
+    [CmdletBinding(SupportsShouldProcess=$true, ConfirmImpact='High')]
+    param(
+        [Parameter(ValueFromPipeline=$true, ValueFromPipelineByPropertyName=$true)]
+        [string[]]$InputObject,
+
+        [ValidateRange(1,16)]
+        [int]$Concurrency = 2,
+
+        [switch]$DryRun,
+
+        [switch]$Force
+    )
+
+    begin {
+        $items = @()
+        Write-YLLog -Message "Mass-Remove start; Concurrency=$Concurrency; DryRun=$DryRun" -Level 'INFO'
+    }
+    process {
+        foreach ($i in $InputObject) { $items += $i }
+    }
+    end {
+        if (-not $items) { Write-Warning "No items provided to Mass-Remove"; return }
+        $jobs = @()
+        foreach ($name in $items) {
+            $script = {
+                param($n,$dry,$force)
+                Import-Module (Split-Path -Parent $MyInvocation.MyCommand.Definition) -Force
+                App-Uninstall -Name $n -DryRun:$dry -Force:$force
+            }
+            $jobs += Start-Job -ScriptBlock $script -ArgumentList @($name, $DryRun.IsPresent, $Force.IsPresent)
+            while ($jobs.Count -ge $Concurrency) {
+                $done = Wait-Job -Job $jobs -Any -Timeout 1
+                $jobs = $jobs | Where-Object { $_.State -eq 'Running' }
+            }
+        }
+        # Wait for remaining
+        if ($jobs) { Wait-Job -Job $jobs }
+        foreach ($j in $jobs) { Receive-Job -Job $j -ErrorAction SilentlyContinue | Out-Null; Remove-Job -Job $j -Force -ErrorAction SilentlyContinue }
+        Write-YLLog -Message "Mass-Remove finished for items: $($items -join ', ')" -Level 'INFO'
+    }
+}
+Export-ModuleMember -Function Mass-Remove
+
+function Stubborn-Uninstall {
+<#
+.SYNOPSIS
+Forceful removal attempts for stubborn or partially uninstalled applications.
+
+.DESCRIPTION
+Tries several strategies and escalations:
+- Attempts App-Uninstall first
+- Kills processes holding files
+- Removes leftover files and registry keys
+- Uses msiexec /x where applicable
+- Generates a detailed report in $env:TEMP on completion
+
+.PARAMETER Name
+Application name or partial name.
+
+.PARAMETER KillProcesses
+Kill processes matching the application name.
+
+.PARAMETER DeepClean
+Attempt aggressive file and registry deletion.
+
+.PARAMETER DryRun
+Simulate actions.
+
+.PARAMETER Force
+Bypass confirmations.
+
+.EXAMPLE
+Stubborn-Uninstall -Name "SomeApp" -KillProcesses -DeepClean -Force
+#>
+    [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
+    param(
+        [Parameter(Mandatory=$true, Position=0)]
+        [string]$Name,
+
+        [switch]$KillProcesses,
+
+        [switch]$DeepClean,
+
+        [switch]$DryRun,
+
+        [switch]$Force
+    )
+
+    begin {
+        $report = [System.Collections.Generic.List[psobject]]::new()
+        $reportFile = Join-Path $env:TEMP ("YLMassRemove_StubbornReport_{0}.txt" -f ([guid]::NewGuid().ToString()))
+        Write-YLLog -Message "Stubborn-Uninstall starting for $Name" -Level 'INFO'
+    }
+    process {
+        # First, call App-Uninstall to try standard removal
+        App-Uninstall -Name $Name -DryRun:$DryRun -Force:$Force
+
+        if ($KillProcesses) {
+            $procs = Get-Process | Where-Object { ($_.ProcessName -like "*$Name*") -or ($_.Path -and ($_.Path -like "*$Name*")) } -ErrorAction SilentlyContinue
+            foreach ($p in $procs) {
+                $desc = "Kill process $($p.ProcessName) (PID $($p.Id))"
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    Stop-Process -Id $p.Id -Force -ErrorAction Stop
+                }
+                $report.Add([pscustomobject]@{ Action='KilledProcess'; Process=$p.ProcessName; PID=$p.Id })
+            }
+        }
+
+        if ($DeepClean) {
+            # Attempt to find typical install locations and remove them
+            $possiblePaths = @(
+                Join-Path $env:ProgramFiles $Name,
+                Join-Path $env:ProgramFilesX86 $Name,
+                Join-Path $env:LOCALAPPDATA $Name,
+                Join-Path $env:PROGRAMDATA $Name
+            ) | Where-Object { Test-Path $_ }
+
+            foreach ($p in $possiblePaths) {
+                $desc = "Deep remove folder $p"
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    Remove-Item -Path $p -Recurse -Force -ErrorAction Stop
+                }
+                $report.Add([pscustomobject]@{ Action='RemovedFolder'; Path=$p })
+            }
+
+            # Registry cleanup best-effort
+            $regPaths = @(
+                "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall",
+                "HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+                "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall"
+            )
+            foreach ($r in $regPaths) {
+                try {
+                    $keys = Get-ChildItem -Path $r -ErrorAction SilentlyContinue
+                    foreach ($k in $keys) {
+                        $props = Get-ItemProperty -Path $k.PSPath -ErrorAction SilentlyContinue
+                        if ($props.DisplayName -and ($props.DisplayName -like "*$Name*")) {
+                            $desc = "Remove registry key $($k.PSPath)"
+                            Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                                Remove-Item -Path $k.PSPath -Recurse -Force -ErrorAction Stop
+                            }
+                            $report.Add([pscustomobject]@{ Action='RemovedRegistry'; Key=$k.PSPath })
+                        }
+                    }
+                } catch { }
+            }
+        }
+
+        # Save report
+        $report | Out-File -FilePath $reportFile -Force -Encoding UTF8
+        Write-YLLog -Message "Stubborn-Uninstall report saved to $reportFile" -Level 'INFO'
+        Write-Host "Report: $reportFile"
+    }
+    end {
+        Write-YLLog -Message "Stubborn-Uninstall complete for $Name" -Level 'INFO'
+    }
+}
+Export-ModuleMember -Function Stubborn-Uninstall
+
+function UWP-Uninstall {
+<#
+.SYNOPSIS
+Uninstall a UWP app by name or package full name.
+
+.DESCRIPTION
+Removes Appx packages for current user or all users depending on parameters.
+Supports -WhatIf, -Confirm, and -DryRun.
+
+.PARAMETER Name
+Partial name match for app package.
+
+.PARAMETER PackageFullName
+Exact package full name.
+
+.PARAMETER AllUsers
+Remove package for all users (requires admin).
+
+.PARAMETER DryRun
+Simulate actions.
+
+.PARAMETER Force
+Bypass confirmations.
+
+.EXAMPLE
+UWP-Uninstall -Name "Xbox" -AllUsers
+#>
+    [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='Medium')]
+    param(
+        [Parameter(Position=0)]
+        [string]$Name,
+
+        [Parameter(Position=1)]
+        [string]$PackageFullName,
+
+        [switch]$AllUsers,
+
+        [switch]$DryRun,
+
+        [switch]$Force
+    )
+
+    begin {
+        Write-YLLog -Message "UWP-Uninstall invoked; Name=$Name; PackageFullName=$PackageFullName; AllUsers=$AllUsers" -Level 'DEBUG'
+    }
+    process {
+        $matches = @()
+        if ($PackageFullName) {
+            $matches = @(Get-AppxPackage -Name $PackageFullName -ErrorAction SilentlyContinue)
+            if (-not $matches) {
+                $matches = @(Get-AppxPackage | Where-Object { $_.PackageFullName -eq $PackageFullName })
+            }
+        } elseif ($Name) {
+            $matches = @(Get-AppxPackage -Name "*$Name*" -ErrorAction SilentlyContinue)
+        } else {
+            Write-Warning "Specify -Name or -PackageFullName"
+            return
+        }
+
+        if (-not $matches) {
+            Write-Warning "No UWP package matched."
+            return
+        }
+
+        foreach ($m in $matches) {
+            $desc = "Remove UWP package $($m.PackageFullName)"
+            if ($AllUsers) {
+                # Remove for all users requires admin and use Remove-AppxProvisionedPackage for provisioning
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    Add-AppxPackage -Path $m.InstallLocation -Register -DisableDevelopmentMode -ErrorAction SilentlyContinue
+                    Remove-AppxPackage -Package $m.PackageFullName -AllUsers -ErrorAction Stop
+                }
+            } else {
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    Remove-AppxPackage -Package $m.PackageFullName -ErrorAction Stop
+                }
+            }
+        }
+    }
+    end {
+        Write-YLLog -Message "UWP-Uninstall completed" -Level 'INFO'
+    }
+}
+Export-ModuleMember -Function UWP-Uninstall
+
+function MassUWP-Uninstall {
+<#
+.SYNOPSIS
+Uninstall multiple UWP packages matching a pattern or list.
+
+.PARAMETER Names
+Array of partial names to match.
+
+.PARAMETER DryRun
+Simulate actions.
+
+.PARAMETER Force
+Bypass confirmations.
+
+.EXAMPLE
+MassUWP-Uninstall -Names 'Xbox','Bing'
+#>
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [Parameter(Mandatory=$true,ValueFromPipeline=$true)]
+        [string[]]$Names,
+
+        [switch]$DryRun,
+
+        [switch]$Force
+    )
+
+    begin {
+        $namesList = @()
+    }
+    process {
+        foreach ($n in $Names) { $namesList += $n }
+    }
+    end {
+        foreach ($n in $namesList) {
+            UWP-Uninstall -Name $n -DryRun:$DryRun -Force:$Force
+        }
+    }
+}
+Export-ModuleMember -Function MassUWP-Uninstall
+
+function List-Apps {
+<#
+.SYNOPSIS
+List installed applications (classic and UWP) with filtering.
+
+.DESCRIPTION
+Combines registry-based classic app listings, Get-Package output, and Get-AppxPackage to present
+a unified view. Supports filtering by name, regular expressions, and export options.
+
+.PARAMETER Filter
+Name or wildcard filter.
+
+.PARAMETER Regex
+If true, treat Filter as regex.
+
+.PARAMETER IncludeUWP
+Include UWP apps.
+
+.PARAMETER ExportPath
+Optional CSV or JSON export path. Extension determines format.
+
+.EXAMPLE
+List-Apps -Filter "7-Zip"
+#>
+    [CmdletBinding()]
+    param(
+        [string]$Filter,
+
+        [switch]$Regex,
+
+        [switch]$IncludeUWP = $true,
+
+        [string]$ExportPath
+    )
+
+    begin {
+        $results = [System.Collections.Generic.List[psobject]]::new()
+    }
+    process {
+        # Classic apps from registry
+        $hives = @('HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall','HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall','HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall')
+        foreach ($h in $hives) {
+            try {
+                $items = Get-ChildItem -Path $h -ErrorAction SilentlyContinue
+                foreach ($it in $items) {
+                    $props = Get-ItemProperty -Path $it.PSPath -ErrorAction SilentlyContinue
+                    if ($props.DisplayName) {
+                        $obj = [pscustomobject]@{
+                            Source = 'Registry'
+                            Name = $props.DisplayName
+                            DisplayVersion = $props.DisplayVersion
+                            Publisher = $props.Publisher
+                            UninstallString = $props.UninstallString
+                            InstallLocation = $props.InstallLocation
+                        }
+                        $add = $true
+                        if ($Filter) {
+                            if ($Regex) {
+                                $add = ($obj.Name -match $Filter)
+                            } else {
+                                $add = ($obj.Name -like "*$Filter*")
+                            }
+                        }
+                        if ($add) { $results.Add($obj) }
+                    }
+                }
+            } catch { }
+        }
+
+        # PackageManagement packages
+        try {
+            $pkgs = Get-Package -ErrorAction SilentlyContinue
+            foreach ($p in $pkgs) {
+                $obj = [pscustomobject]@{
+                    Source = "Package($($p.ProviderName))"
+                    Name = $p.Name
+                    Version = $p.Version
+                    Provider = $p.ProviderName
+                }
+                $add = $true
+                if ($Filter) {
+                    if ($Regex) { $add = ($obj.Name -match $Filter) } else { $add = ($obj.Name -like "*$Filter*") }
+                }
+                if ($add) { $results.Add($obj) }
+            }
+        } catch { }
+
+        if ($IncludeUWP) {
+            $uwp = Get-AppxPackage -ErrorAction SilentlyContinue
+            foreach ($u in $uwp) {
+                $obj = [pscustomobject]@{
+                    Source = 'UWP'
+                    Name = $u.Name
+                    PackageFullName = $u.PackageFullName
+                    Publisher = $u.Publisher
+                }
+                $add = $true
+                if ($Filter) {
+                    if ($Regex) { $add = ($obj.Name -match $Filter) } else { $add = ($obj.Name -like "*$Filter*") }
+                }
+                if ($add) { $results.Add($obj) }
+            }
+        }
+    }
+    end {
+        $results
+        if ($ExportPath) {
+            $ext = [IO.Path]::GetExtension($ExportPath).ToLower()
+            if ($ext -eq '.json') { $results | ConvertTo-Json -Depth 5 | Out-File -FilePath $ExportPath -Force -Encoding UTF8 }
+            else { $results | Export-Csv -Path $ExportPath -NoTypeInformation -Force }
+            Write-YLLog -Message "List-Apps exported results to $ExportPath" -Level 'INFO'
+        }
+    }
+}
+Export-ModuleMember -Function List-Apps
+
+function Uninstall-Update {
+<#
+.SYNOPSIS
+Remove a Windows Update by KB number or update title.
+
+.DESCRIPTION
+Removes updates responsibly using wusa.exe or the appropriate PowerShell APIs. Requires admin privileges.
+
+.PARAMETER KB
+KB number (e.g., KB5006670)
+
+.PARAMETER Title
+Partial update title match.
+
+.PARAMETER DryRun
+Simulate removal.
+
+.PARAMETER Force
+Bypass confirmations.
+
+.EXAMPLE
+Uninstall-Update -KB "KB5015684" -DryRun
+#>
+    [CmdletBinding(SupportsShouldProcess=$true,ConfirmImpact='High')]
+    param(
+        [Parameter(Position=0)]
+        [string]$KB,
+
+        [string]$Title,
+
+        [switch]$DryRun,
+
+        [switch]$Force
+    )
+
+    begin {
+        Write-YLLog -Message "Uninstall-Update started; KB=$KB; Title=$Title" -Level 'DEBUG'
+    }
+    process {
+        if (-not ($KB -or $Title)) {
+            Write-Warning "Specify -KB or -Title"
+            return
+        }
+
+        # Query installed updates via WMI
+        $updates = Get-WmiObject -Class Win32_QuickFixEngineering -ErrorAction SilentlyContinue
+        if ($KB) {
+            $matches = $updates | Where-Object { $_.HotFixID -eq $KB }
+        } else {
+            $matches = $updates | Where-Object { $_.Description -like "*$Title*" -or $_.Caption -like "*$Title*" }
+        }
+
+        if (-not $matches) {
+            Write-Warning "No matching updates found"
+            return
+        }
+
+        foreach ($u in $matches) {
+            $desc = "Uninstall update $($u.HotFixID) - $($u.Description)"
+            Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                # Use wusa.exe /uninstall /kb:$KB /quiet /norestart if HotFixID starts with KB
+                if ($u.HotFixID -match '^KB') {
+                    Start-Process -FilePath "$env:SystemRoot\System32\wusa.exe" -ArgumentList "/uninstall /kb:$($u.HotFixID -replace 'KB','') /quiet /norestart" -Wait -NoNewWindow
+                } else {
+                    # Best-effort removal via wusa or msu
+                    throw "Cannot reliably uninstall update $($u.HotFixID) via automated method"
+                }
+            }
+        }
+    }
+    end {
+        Write-YLLog -Message "Uninstall-Update completed" -Level 'INFO'
+    }
+}
+Export-ModuleMember -Function Uninstall-Update
+
+function Update-ALL {
+<#
+.SYNOPSIS
+Run update workflows: Windows Update, module updates, and refresh package providers.
+
+.DESCRIPTION
+Convenience function to run PSWindowsUpdate, update installed PowerShell modules and Providers, and optionally reboot.
+
+.PARAMETER IncludeWindows
+Run Windows Update scan and install available important updates.
+
+.PARAMETER IncludeModules
+Update PowerShell modules from PSGallery.
+
+.PARAMETER Reboot
+Reboot automatically if required.
+
+.PARAMETER DryRun
+Simulate actions.
+
+.PARAMETER Force
+Bypass confirmations.
+
+.EXAMPLE
+Update-ALL -IncludeWindows -IncludeModules -Reboot
+#>
+    [CmdletBinding(SupportsShouldProcess=$true)]
+    param(
+        [switch]$IncludeWindows,
+        [switch]$IncludeModules,
+        [switch]$Reboot,
+        [switch]$DryRun,
+        [switch]$Force
+    )
+
+    begin {
+        Write-YLLog -Message "Update-ALL started; IncludeWindows=$IncludeWindows; IncludeModules=$IncludeModules" -Level 'INFO'
+    }
+    process {
+        if ($IncludeWindows) {
+            if (Get-Module -ListAvailable -Name PSWindowsUpdate) {
+                $desc = "Perform Windows updates via PSWindowsUpdate"
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    Import-Module PSWindowsUpdate -Force -ErrorAction Stop
+                    Get-WindowsUpdate -Install -AcceptAll -IgnoreReboot
+                }
+            } else {
+                Write-Warning "PSWindowsUpdate module not available; skipping Windows update step"
+            }
+        }
+
+        if ($IncludeModules) {
+            $modules = Get-InstalledModule -ErrorAction SilentlyContinue
+            foreach ($m in $modules) {
+                $desc = "Update module $($m.Name) to latest"
+                Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                    try {
+                        Update-Module -Name $m.Name -Force -ErrorAction Stop
+                    } catch {
+                        Write-YLLog -Message "Failed to update module $($m.Name): $_" -Level 'ERROR'
+                    }
+                }
+            }
+        }
+
+        if ($Reboot) {
+            $desc = "Reboot system"
+            Invoke-YLSafeAction -Description $desc -DryRun:$DryRun -Force:$Force -Action {
+                Restart-Computer -Force
+            }
+        }
+    }
+    end {
+        Write-YLLog -Message "Update-ALL finished" -Level 'INFO'
+    }
+}
+Export-ModuleMember -Function Update-ALL
+
+function YL-Help {
+<#
+.SYNOPSIS
+Dynamic help viewer for the YLMassRemove module.
+
+.DESCRIPTION
+Displays detailed help pages for the module, all cmdlets, or a specific cmdlet.
+Supports interactive selection, search, and displays example usage pulled from comment-based help.
+Also registers itself in module command registry to provide consistent -Help/-h behavior.
+
+.PARAMETER Name
+Name of cmdlet to view help for. If omitted, lists all available commands.
+
+.PARAMETER Search
+Search term to filter by synopsis or name.
+
+.PARAMETER ShowExamples
+Show full examples for a cmdlet.
+
+.PARAMETER OutputFormat
+Text or Markdown.
+
+.EXAMPLE
+YL-Help -Name App-Uninstall -ShowExamples
+#>
+    [CmdletBinding()]
+    param(
+        [string]$Name,
+
+        [string]$Search,
+
+        [switch]$ShowExamples,
+
+        [ValidateSet('Text','Markdown')]
+        [string]$OutputFormat = 'Text'
+    )
+
+    begin {
+        # Refresh registry
+        $reg = Get-YLModuleFunctionSignatures
+    }
+    process {
+        if ($Name) {
+            try {
+                $help = Get-Help -Name $Name -Full -ErrorAction SilentlyContinue
+                if ($help) {
+                    if ($OutputFormat -eq 'Markdown') {
+                        # Basic Markdown rendering
+                        Write-Output "## $($help.Name)"
+                        Write-Output ""
+                        Write-Output "**Synopsis:** $($help.Synopsis)"
+                        Write-Output ""
+                        Write-Output "**Syntax**"
+                        foreach ($s in $help.Syntax) { Write-Output "`$ $($s.ToString())`" }
+                        Write-Output ""
+                        Write-Output "**Description**"
+                        Write-Output $help.Description
+                        if ($ShowExamples) {
+                            Write-Output ""
+                            Write-Output "**Examples**"
+                            foreach ($ex in $help.Examples) {
+                                Write-Output "```powershell"
+                                Write-Output $ex.Code
+                                Write-Output "```"
+                            }
+                        }
+                    else {
+                        $help | Out-String | Write-Host
+                        if ($ShowExamples) {
+                            $help.Examples | ForEach-Object {
+                                Write-Host "EXAMPLE:`n$($_.Code)`n"
+                            }
+                        }
+                    }
+                } else {
+                    Write-Warning "No help found for $Name"
+                }
+            } catch {
+                Write-YLLog -Message "YL-Help error: $_" -Level 'ERROR'
+            }
+            return
+        }
+
+        # List all commands with synopsis or filter by Search
+        $items = @()
+        foreach ($k in $reg.GetEnumerator()) {
+            $add = $true
+            if ($Search) {
+                $add = ($k.Key -match $Search) -or ($k.Value.Synopsis -and ($k.Value.Synopsis -match $Search))
+            }
+            if ($add) {
+                $items += [pscustomobject]@{
+                    Name = $k.Key
+                    Synopsis = $k.Value.Synopsis
+                }
+            }
+        }
+        if (-not $items) { Write-Host "No commands found" ; return }
+        $table = $items | Sort-Object Name
+        if ($OutputFormat -eq 'Markdown') {
+            Write-Output "| Name | Synopsis |"
+            Write-Output "|---|---|"
+            foreach ($r in $table) {
+                $syn = ($r.Synopsis -replace '\n',' ')
+                Write-Output "| $($r.Name) | $syn |"
+            }
+        } else {
+            $table | Format-Table -AutoSize
+        }
+    }
+}
+Export-ModuleMember -Function YL-Help
+
+# Provide -Help alias behavior for common cmdlets by registering a wrapper
+function Register-YLHelpAliases {
+    param()
+    $funcs = Get-Command -Module YLMassRemove -ErrorAction SilentlyContinue | Where-Object { $_.CommandType -eq 'Function' }
+    foreach ($f in $funcs) {
+        $aliasName = "$($f.Name)-Help"
+        if (-not (Get-Command -Name $aliasName -ErrorAction SilentlyContinue)) {
+            $script = {
+                param($cmd)
+                YL-Help -Name $cmd -ShowExamples
+            }
+            New-Item -Path Function:\$aliasName -Value ($script) -Force | Out-Null
+        }
+    }
+}
+Register-YLHelpAliases
+
+# Add fallback -Help parameter support for top-level invocation pattern
+# Provide shorthand function to call YL-Help if -Help used on module import
+function Show-ModuleHelpIfRequested {
+    param(
+        [Parameter(ValueFromRemainingArguments=$true)]
+        [string[]]$Args
+    )
+    if ($Args -and ($Args -contains '-Help' -or $Args -contains '-h')) {
+        YL-Help
+    }
+}
+# Attempt to register the script-level handler (best-effort; context dependent)
+# Note: This is a convenience and may not trigger in some hosts.
+
+#endregion
+
+#region Convenience aliases and backwards-compatible wrappers
+
+# Wrapper for App-Uninstall
+function rm-app {
+    param(
+        [Parameter(ValueFromPipeline=$true)]
+        [string]$Name,
+        [switch]$Recurse,
+        [switch]$DryRun,
+        [switch]$Force
+    )
+    App-Uninstall -Name $Name -Recurse:$Recurse -DryRun:$DryRun -Force:$Force
+}
+
+# Wrapper for Mass-Remove
+function rm-bulk {
+    param(
+        [Parameter(ValueFromPipeline=$true)]
+        [string[]]$Names,
+        [int]$Concurrency = 2,
+        [switch]$DryRun,
+        [switch]$Force
+    )
+    Mass-Remove -InputObject $Names -Concurrency $Concurrency -DryRun:$DryRun -Force:$Force
+}
+
+# Wrapper for UWP-Uninstall
+function rm-uwp {
+    param(
+        [string]$Name,
+        [switch]$AllUsers,
+        [switch]$DryRun,
+        [switch]$Force
+    )
+    UWP-Uninstall -Name $Name -AllUsers:$AllUsers -DryRun:$DryRun -Force:$Force
+}
+
+# Wrapper for MassUWP-Uninstall
+function rm-uwpbulk {
+    param(
+        [string[]]$Names,
+        [switch]$DryRun,
+        [switch]$Force
+    )
+    MassUWP-Uninstall -Names $Names -DryRun:$DryRun -Force:$Force
+}
+
+# Wrapper for List-Apps
+function ls-progs {
+    param(
+        [string]$Filter,
+        [switch]$Regex,
+        [switch]$IncludeUWP = $true,
+        [string]$ExportPath
+    )
+    List-Apps -Filter $Filter -Regex:$Regex -IncludeUWP:$IncludeUWP -ExportPath $ExportPath
+}
+
+# Wrapper for Uninstall-Update
+function rm-upd {
+    param(
+        [string]$KB,
+        [string]$Title,
+        [switch]$DryRun,
+        [switch]$Force
+    )
+    Uninstall-Update -KB $KB -Title $Title -DryRun:$DryRun -Force:$Force
+}
+
+# Wrapper for Update-ALL
+function uptodate {
+    param(
+        [switch]$IncludeWindows,
+        [switch]$IncludeModules,
+        [switch]$Reboot,
+        [switch]$DryRun,
+        [switch]$Force
+    )
+    Update-ALL -IncludeWindows:$IncludeWindows -IncludeModules:$IncludeModules -Reboot:$Reboot -DryRun:$DryRun -Force:$Force
+}
+
+# Wrapper for YL-Help
+function yl-hlp32 {
+    param(
+        [string]$Name,
+        [switch]$ShowExamples,
+        [ValidateSet('Text','Markdown')]
+        [string]$OutputFormat = 'Text')
+    }
+    YL-Help -Name $Name -ShowExamples:$ShowExamples -OutputFormat $OutputFormat
+
+# Uninstalling hard-to-remove apps
+function rmhard-bulk {
+    param(
+        [Parameter(Mandatory=$true, ValueFromPipeline=$true)]
+        [string[]]$Names,
+
+        [switch]$KillProcesses,
+        [switch]$DeepClean,
+        [switch]$DryRun,
+        [switch]$Force
+
+        )    
+    }	
+    process {
+        foreach ($name in $Names) {
+            MassStubborn-Uninstall -Name $name -KillProcesses:$KillProcesses -DeepClean:$DeepClean -DryRun:$DryRun -Force:$Force
+        }
+    }
+	function rmhard-app {
+    param(
+        [Parameter(Mandatory=$true)]
+        [string]$Name,
+
+        [switch]$KillProcesses,
+        [switch]$DeepClean,
+        [switch]$DryRun,
+        [switch]$Force
+    )
+    Stubborn-Uninstall -Name $Name `
+                       -KillProcesses:$KillProcesses `
+                       -DeepClean:$DeepClean `
+                       -DryRun:$DryRun `
+                       -Force:$Force
+}
+
+Set-Alias -Name rm-app -Value App-Uninstall -Scope Global
+Set-Alias -Name rm-bulk -Value Mass-Remove -Scope Global
+Set-Alias -Name rm-uwp -Value UWP-Uninstall -Scope Global
+Set-Alias -Name rm-uwpbulk -Value MassUWP-Uninstall -Scope Global
+Set-Alias -Name ls-progs -Value List-Apps -Scope Global
+Set-Alias -Name rm-upd -Value Uninstall-Update -Scope Global
+Set-Alias -Name uptodate -Value Update-ALL -Scope Global
+Set-Alias -Name yl-hlp32 -Value YL-Help -Scope Global
+Set-Alias -Name rmhard-bulk -Value MassStubborn-Uninstall -Scope Global
+Set-Alias -Name rmhard-app -Value Stubborn-Uninstall -Scope Global
+
+#endregion
+
+#region Robustness: import-time validations and manifest checks
+
+function Validate-YLModuleState {
+    param()
+    
+	# ============================================================================
+# Module validation and self-check routine
+# Adds strong defensive checks at import time and reports diagnostics.
+# Safe, non-destructive, and deliberately verbose to help debug parse issues.
+# ============================================================================
+function Initialize-YLModuleValidation {
+    [CmdletBinding(DefaultParameterSetName='Normal')]
+    param(
+        [Parameter(Mandatory=$false)]
+        [string]$ModuleName = 'YLMassRemove',
+
+        [Parameter(Mandatory=$false)]
+        [switch]$VerboseDiagnostics
+    )
+
+    # Local helper: safe logging fallback if Write-YLLog is missing
+    function Invoke-SafeLog {
+        param(
+            [string]$Message,
+            [ValidateSet('DEBUG','INFO','WARN','ERROR')]
+            [string]$Level = 'INFO'
+        )
+        try {
+            if (Get-Command -Name Write-YLLog -ErrorAction SilentlyContinue) {
+                Write-YLLog -Message $Message -Level $Level
+            } else {
+                $ts = (Get-Date).ToString('s')
+                switch ($Level) {
+                    'DEBUG' { Write-Verbose "[$ts] DEBUG: $Message" }
+                    'INFO'  { Write-Output    "[$ts] INFO : $Message" }
+                    'WARN'  { Write-Warning   "[$ts] WARN : $Message" }
+                    'ERROR' { Write-Error     "[$ts] ERROR: $Message" }
+                }
+            }
+        } catch {
+            # last-resort fallback
+            Write-Verbose "Invoke-SafeLog failed: $($_.Exception.Message)"
+        }
+    }
+
+    # Local helper: parse-only check to ensure this file parses (non-executing)
+    function Test-ModuleScriptParse {
+        param(
+            [Parameter(Mandatory=$true)][string]$Path
+        )
+        try {
+            $content = Get-Content -Raw -LiteralPath $Path -ErrorAction Stop
+            # Create a scriptblock object to force parse-only evaluation
+            [void][scriptblock]::Create($content)
+            return $true
+        } catch {
+            # Provide detailed parse diagnostics
+            $err = $_.Exception.Message
+            Invoke-SafeLog -Message ("Parse test failed for '{0}': {1}" -f $Path, $err) -Level 'ERROR'
+            return $false
+        }
+    }
+
+    # Local helper: check for unbalanced braces
+    function Get-BraceBalance {
+        param([Parameter(Mandatory=$true)][string]$Text)
+        $open  = ($Text.ToCharArray() | Where-Object {$_ -eq '{'}).Count
+        $close = ($Text.ToCharArray() | Where-Object {$_ -eq '}'}).Count
+        return [PSCustomObject]@{ Open=$open; Close=$close; Delta=($open - $close) }
+    }
+
+    # Main body
+    try {
+        Invoke-SafeLog -Message "Starting import-time validation for module '$ModuleName'." -Level 'DEBUG'
+
+        # Identify the module file path: this script's containing module file
+        $scriptPath = $PSCommandPath
+        if (-not $scriptPath) {
+            # Fallback for older hosts or unusual contexts
+            $scriptPath = $MyInvocation.MyCommand.Definition
+        }
+
+        if (-not $scriptPath) {
+            Invoke-SafeLog -Message "Unable to determine current script path for parse validation." -Level 'WARN'
+            return
+        }
+
+        # Diagnostic: file existence
+        if (-not (Test-Path -LiteralPath $scriptPath)) {
+            Invoke-SafeLog -Message ("Module file not found: {0}" -f $scriptPath) -Level 'ERROR'
+            return
+        }
+
+        # Read raw content once
+        $raw = Get-Content -Raw -LiteralPath $scriptPath -ErrorAction Stop
+
+        # Check brace balance early to catch common parser issues
+        $balance = Get-BraceBalance -Text $raw
+        if ($balance.Delta -ne 0) {
+            Invoke-SafeLog -Message ("Brace mismatch detected in {0}: Open={1} Close={2} Delta={3}" -f $scriptPath, $balance.Open, $balance.Close, $balance.Delta) -Level 'ERROR'
+            if (-not $VerboseDiagnostics) { return }
+        } else {
+            Invoke-SafeLog -Message "Brace balance OK." -Level 'DEBUG'
+        }
+
+        # Check for unterminated here-strings
+        $hereStringStarts = 0
+        if ($raw -match '@"' -or $raw -match "@'") {
+            # quick heuristic: count occurrences of start and end tokens
+            $hereStringStarts = ([regex]::Matches($raw, '@"').Count + [regex]::Matches($raw, "@'").Count)
+            $hereStringEnds   = ([regex]::Matches($raw, '"@').Count + [regex]::Matches($raw, "'@").Count)
+            if ($hereStringStarts -ne $hereStringEnds) {
+                Invoke-SafeLog -Message ("Potential unterminated here-string detected. Starts={0} Ends={1}" -f $hereStringStarts, $hereStringEnds) -Level 'ERROR'
+                if (-not $VerboseDiagnostics) { return }
+            } else {
+                Invoke-SafeLog -Message "Here-string counts look balanced." -Level 'DEBUG'
+            }
+        }
+
+        # Parse-only test (very explicit)
+        $parseOk = Test-ModuleScriptParse -Path $scriptPath
+        if (-not $parseOk) {
+            Invoke-SafeLog -Message "Parse-only validation failed; aborting further import-time checks." -Level 'ERROR'
+            return
+        }
+
+        # Check that the module appears in the PSModulePath list and warn if not
+        try {
+            $mod = Get-Module -Name $ModuleName -ListAvailable -ErrorAction SilentlyContinue
+            if (-not $mod) {
+                Invoke-SafeLog -Message "Module '$ModuleName' not found in PSModulePath; some cmdlets may not persist across sessions." -Level 'WARN'
+            } else {
+                Invoke-SafeLog -Message ("Module discovery ok: {0} (Version {1})" -f $mod.Name, $mod.Version) -Level 'DEBUG'
+            }
+        } catch {
+            Invoke-SafeLog -Message ("Module discovery check failed: {0}" -f $_.Exception.Message) -Level 'ERROR'
+        }
+
+        # Optional: list exported commands and check for duplicates (safe read-only)
+        try {
+            $exports = Get-Command -CommandType Function,Cmdlet -Module $ModuleName -ErrorAction SilentlyContinue
+            if ($exports) {
+                # Build name collision check
+                $names = $exports.Name
+                $dups  = $names | Group-Object | Where-Object { $_.Count -gt 1 } | Select-Object -ExpandProperty Name
+                if ($dups) {
+                    Invoke-SafeLog -Message ("Duplicate exported command names detected: {0}" -f ($dups -join ', ')) -Level 'WARN'
+                } else {
+                    Invoke-SafeLog -Message ("Exported commands count: {0}" -f ($names.Count)) -Level 'DEBUG'
+                }
+            } else {
+                Invoke-SafeLog -Message "No exported commands discovered for this module during validation." -Level 'DEBUG'
+            }
+        } catch {
+            Invoke-SafeLog -Message ("Export inspection failed: {0}" -f $_.Exception.Message) -Level 'ERROR'
+        }
+
+        Invoke-SafeLog -Message "Module import-time validation completed successfully." -Level 'INFO'
+        return $true
+    }
+    catch {
+        # Always provide the exception message and preserve stack trace succinctly
+        $em = $_.Exception
+        Invoke-SafeLog -Message ("Initialization error: {0}" -f $em.Message) -Level 'ERROR'
+        return $false
+    }
+    finally {
+        if ($VerboseDiagnostics) {
+            Invoke-SafeLog -Message "Verbose diagnostics enabled: end of Initialize-YLModuleValidation." -Level 'DEBUG'
+        }
+    }
+}
+
+# Safe invocation: call the initializer in a try/catch to guarantee balanced blocks at top-level
+try {
+    # You may enable verbose diagnostics during active debugging by setting $true
+    Initialize-YLModuleValidation -ModuleName 'YLMassRemove' -VerboseDiagnostics:$false | Out-Null
+}
+catch {
+    # Top-level catch used only to prevent import-time parse issues; it will log the error and continue
+    if (Get-Command -Name Write-YLLog -ErrorAction SilentlyContinue) {
+        Write-YLLog -Message ("Unhandled import-time validation error: {0}" -f $_.Exception.Message) -Level 'ERROR'
+    } else {
+        Write-Error ("Unhandled import-time validation error: {0}" -f $_.Exception.Message)
+    }
+}
+
+#endregion
+
+# End of module file
+
+}
