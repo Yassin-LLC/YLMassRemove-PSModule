@@ -74,52 +74,17 @@ YLMassRemove packages a broad set of removal tools in a single module:
 
 ---
 
+## Installation
 
+- You can install our Module through the [PSGallery](https://www.powershellgallery.com) by using this command in an administrative powershell window:
 
+```Install-Module -Name YLMassRemove -Scope AllUsers```
 
-## Quick installation
+- If this doesn't work run this command in the same administrative powershell window:
 
-Manual (local module folder):
-1. Create the module folder in one of the paths listed in `$Env:PSModulePath`, for example:
-   - `%USERPROFILE%\Documents\WindowsPowerShell\Modules\YLMassRemove\`
-2. Copy `YLMassRemove.psm1` and `YLMassRemove.psd1` into that folder.
-3. Import the module:
-   ```powershell
-   Import-Module YLMassRemove
-   ```
-4. Verify:
-   ```powershell
-   Get-Module YLMassRemove
-   ```
+```Set-ExecutionPolicy Bypass -Scope Process```
 
-Publish to PowerShell Gallery:
-- Ensure `PowerShellVersion` in the `.psd1` is `3.0` or higher before calling `Publish-Module`.
-- Use `Publish-Module` with a valid API key and follow PowerShell Gallery publishing guidelines.
-
----
-
-## Persistent aliases
-To make convenient aliases available across sessions, add alias lines to your PowerShell profile (`$PROFILE`):
-
-```powershell
-# Example to persist aliases
-Set-Alias -Name rm-app -Value App-Uninstall -Scope Global
-Set-Alias -Name rm-bulk -Value Mass-Remove -Scope Global
-Set-Alias -Name rmhard-app -Value Stubborn-Uninstall -Scope Global
-Set-Alias -Name rmhard-bulk -Value MassStubborn-Uninstall -Scope Global
-Set-Alias -Name ls-progs -Value List-Apps -Scope Global
-Set-Alias -Name uptodate -Value Update-ALL -Scope Global
-Set-Alias -Name yl-hlp32 -Value TL-Help -Scope Global
-Set-Alias -Name rm-uwp -Value UWP-Uninstall -Scope Global
-Set-Alias -Name rm-uwpbulk -Value MassUWP-Uninstall -Scope Global
-
-```
-
-Open your profile to edit:
-```powershell
-notepad $PROFILE
-```
-Paste desired `Set-Alias` lines, save, and restart PowerShell.
+- Then run the same `Install-Module` command above
 
 ---
 
@@ -280,6 +245,7 @@ MIT License
 ## Contact and project links
 - Repository: https://github.com/Yassin-LLC/YLMassRemove-PSModule  
 - Project issues and PRs: open on the repo above
+- X (Twitter Formerly): [Yassin on X](https://www.x.com/DoorsPastaLLC)
 
 ---
 
