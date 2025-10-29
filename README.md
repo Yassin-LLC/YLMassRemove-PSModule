@@ -44,7 +44,7 @@ YLMassRemove packages a broad set of removal tools in a single module:
   - `Update-ALL` (update helper)
 - Dry-run simulation with `-DryRun` and rich logging
 - Per-item and aggregated reporting (CSV / JSON)
-- Robust safety flags: `-WhatIf`, `-Confirm`, `-DryRun`, `-Force`
+- Robust safety flags: `-WhatIf`, `-Confirm`, `-DryRun`, `-Nuke`
 - YL-Help: dynamic, searchable help viewer with examples
 - Backward-compatible convenience wrappers and aliases:
   - `rm-app`, `rm-bulk`, `rmhard-app`, `rmhard-bulk`, `rm-uwp`, `rm-uwpbulk`, `ls-progs`, `uptodate`, `yl-hlp32`
@@ -63,14 +63,17 @@ YLMassRemove packages a broad set of removal tools in a single module:
 ---
 
 ## Flags
--Recurse
--Cleanup
--Nuke
--Search
--Help
--Erase
--DryRun
--Force
+-DryRun: Simulates what the cmdlet does
+-WhatIf: Same as -DryRun but more detailed
+-Force: Does the cmdlet commands powerfully/forcefully
+-Search: Searches through manually chosen paths (e.g., -Search:D:\Apps\Backup,C:\ProgramData,"C:\Windows\Installer") & allows up to 38 locations to search
+-Cleanup: Searches Services, Registry Leftovers & Task Scheduler
+-Recurse: Paired best with -Cleanup, recurses through specified paths
+-Confirm: Confirms the option if it's dangerous
+-Help: Shows info about the cmdlet
+-Nuke: Combines -Recurse, -Confirm, -Force, -Erase & Cleanup
+-Erase: Securely erases folders, files, & registry leftovers
+-ExportHelpAs(Html/csv/md/txt/<CUSTOM_EXT>): Exports the help for that specific cmdlet or alias, or flag in a readable, understandable way
 
 ---
 
@@ -99,19 +102,19 @@ List-Apps -Filter "Zoom" -IncludeUWP
 Single stubborn uninstall:
 ```powershell
 # Direct cmdlet
-Stubborn-Uninstall -Name "McAfee" -KillProcesses -DeepClean -Force
+Stubborn-Uninstall -Name "McAfee" -Nuke -Cleanup -Nuke
 
 # Convenience wrapper (alias)
-rmhard-app -Name "McAfee" -KillProcesses -DeepClean -Force
+rmhard-app -Name "McAfee" -Nuke -Cleanup -Nuke
 ```
 
 Bulk stubborn uninstall (pipeline-friendly):
 ```powershell
 # Direct
-"McAfee","Zoom" | MassStubborn-Uninstall -KillProcesses -DeepClean -Force
+"McAfee","Zoom" | MassStubborn-Uninstall -Nuke -Cleanup -Nuke
 
 # Alias
-"McAfee","Zoom" | rmhard-bulk -KillProcesses -DeepClean -Force
+"McAfee","Zoom" | rmhard-bulk -Nuke -Cleanup -Nuke
 ```
 
 Mass removal simulation and export:
@@ -190,7 +193,7 @@ Mass-Remove -InputObject (Get-Content apps.txt) -DryRun -ExportCsv "removal-sim.
 
 ## Safety and permissions
 - Use `-WhatIf` and `-DryRun` liberally before running destructive operations.
-- `-Confirm` and `-Force` are supported where applicable.
+- `-Confirm` and `-Nuke` are supported where applicable.
 - Administrative rights are required for many operations; run PowerShell as Administrator when performing system-wide removals.
 - The module exposes deep-clean and registry-sweeping options—double-check targets before running.
 
