@@ -63,27 +63,28 @@ YLMassRemove packages a broad set of removal tools in a single module:
 ---
 
 ## Flags
--DryRun: Simulates what the cmdlet does
--WhatIf: Same as -DryRun but more detailed
--Force: Does the cmdlet commands powerfully/forcefully
--Search: Searches through manually chosen paths (e.g., -Search:D:\Apps\Backup,C:\ProgramData,"C:\Windows\Installer") & allows up to 38 locations to search
--Cleanup: Searches Services, Registry Leftovers & Task Scheduler
--Recurse: Paired best with -Cleanup, recurses through specified paths
--Confirm: Confirms the option if it's dangerous
--Help: Shows info about the cmdlet
--Nuke: Combines -Recurse, -Confirm, -Force, -Erase & Cleanup
--Erase: Securely erases folders, files, & registry leftovers
--ExportHelpAs(Html/csv/md/txt/<CUSTOM_EXT>): Exports the help for that specific cmdlet or alias, or flag in a readable, understandable way
+- -DryRun: Simulates what the cmdlet does
+- -WhatIf: Same as -DryRun but more detailed
+- -Force: Does the cmdlet commands powerfully/forcefully
+- -Search: Searches through manually chosen paths (e.g., -Search:D:\Apps\Backup,C:\ProgramData,"C:\Windows\Installer",HKLM\SOFTWARE\*<APP_NAME>*) & allows up to 38 locations to search
+- -Cleanup: Searches Services, Registry Leftovers & Task Scheduler
+- -Recurse: Paired best with -Cleanup, recurses through specified paths
+- -Confirm: Confirms the option if it's dangerous
+- -Help: Shows info about the cmdlet
+- -Nuke: Combines -Recurse, -Confirm, -Force, -Erase & Cleanup
+- -Erase: Securely erases folders, files, & registry leftovers
+- **SubFlags**
+- --ExportHelpAs(Html/csv/md/txt/<CUSTOM_EXT>): Exports the help for that specific cmdlet or alias, or flag in a readable, understandable way
 
 ---
 
 ## Installation
 
-- You can install our Module through the [PSGallery](https://www.powershellgallery.com) by using this command in an administrative powershell window:
+- You can install our Module through the [PSGallery](https://www.powershellgallery.com) by using this command in an administrative PowerShell window:
 
 ```Install-Module -Name YLMassRemove -Scope AllUsers```
 
-- If this doesn't work run this command in the same administrative powershell window:
+- If this doesn't work, run this command in the same administrative PowerShell window:
 
 ```Set-ExecutionPolicy Bypass -Scope Process```
 
