@@ -74,7 +74,10 @@ YLMassRemove packages a broad set of removal tools in a single module:
 - -Nuke: Combines -Recurse, -Confirm, -Force, -Erase & Cleanup
 - -Erase: Securely erases folders, files, & registry leftovers
 - **SubFlags**
-- --ExportHelpAs(Html/csv/md/txt/<CUSTOM_EXT>): Exports the help for that specific cmdlet or alias, or flag in a readable, understandable way
+- --ads-include: includes Alternate Data Streams if exists
+- --system-level: If the app exists (installed at the system level [ALL USERS])
+- --i-know-this-will-bsod: "Driver-Remover" ONLY* removes drivers or stops its processes even if it will Blue Screen
+- --no-system-app-preservation: If the app is so stubborn, use this
 
 ---
 
@@ -139,6 +142,18 @@ Concurrency example (if supported by your environment):
 ```powershell
 "App1","App2","App3" | Mass-Remove -Concurrency 4 -DryRun
 ```
+REMOVING DRIVERZZZZZZ
+```
+"DriverPackageNameOrPath" | Driver-Remover -Default
+```
+Fetching Modules
+```
+Fetmod -Name(eg., PS2EXE) -AsZip(or As7z) -InstallNormally (WONT WORK WITH -As Opts)
+```
+Secure Erase
+```
+Sec-rem -Default:sdelete.exe -f -z -p 3 -r -s (or Sec-rem -Defaultpower2)
+```
 
 ---
 
@@ -155,6 +170,9 @@ Functions exported:
 - Uninstall-Update
 - Update-ALL
 - YL-Help
+- Fetch-Module
+- Secure-Erase
+- Driver-Remover
 
 Convenience wrappers and exported functions:
 - rm-app
@@ -167,6 +185,9 @@ Convenience wrappers and exported functions:
 - ls-progs
 - uptodate
 - yl-hlp32
+- rmdrv
+- sec-rem
+- fetmod
 
 Aliases (examples):
 - `Set-Alias -Name rmhard-bulk -Value MassStubborn-Uninstall -Scope Global`
@@ -202,11 +223,11 @@ Mass-Remove -InputObject (Get-Content apps.txt) -DryRun -ExportCsv "removal-sim.
 
 ## Manifest summary (.psd1)
 Key manifest metadata included in the module:
-- RootModule: `YLMassRemove.psm1`
+- RootModule: `YLMR.psm1`
 - ModuleVersion: `1.0.0`
-- GUID: `b7a3f9e2-3e5a-4d9f-9c6f-ylmassremove0001`
-- Author: `DoorsPastaLLC` / CompanyName: `Yassin-NRO`
-- Description: Aggressive and customizable removal, registry cleanup, UWP uninstallation, update management
+- GUID: `b7a3f9e2-3e5a-4d9f-9c6f-1a2b3c4d5e6f`
+- Author: `DoorsPastaLLC`
+- Description: Aggressive and customizable removal, registry cleanup, UWP uninstallation, update management, driver removement???
 - PowerShellVersion: `5.1` (recommended; ensure >= `3.0` for Publish-Module)
 - CompatiblePSEditions: `Desktop`, `Core`
 - FunctionsToExport: core cmdlets plus convenience wrappers
